@@ -11,7 +11,6 @@ import {
 import { bs58 } from "@coral-xyz/anchor/dist/cjs/utils/bytes";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  NATIVE_MINT,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 

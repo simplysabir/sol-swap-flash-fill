@@ -4,7 +4,7 @@ use anchor_lang::solana_program::sysvar::instructions::{
     load_current_index_checked, load_instruction_at_checked,
 };
 use anchor_lang::Discriminator;
-use anchor_spl::token::TokenAccount;
+use anchor_spl::token::{TokenAccount, Token, Transfer, Mint};
 
 use anchor_lang::system_program;
 
@@ -16,34 +16,31 @@ declare_id!("JUPLdTqUdKztWJ1isGMV92W2QvmEmzs9WTJjhZe4QdJ");
 pub mod flash_fill {
     use super::*;
 
-    pub fn borrow(ctx: Context<Borrow>) -> Result<()> {
+    pub fn borrow(ctx: Context<Borrow>, input_amount: u64, fee_account: Pubkey) -> Result<()> {
         let ixs = ctx.accounts.instructions.to_account_info();
 
-        // make sure this isnt a cpi call
+        // Ensure this is not a CPI call
         let current_index = load_current_index_checked(&ixs)? as usize;
         let current_ix = load_instruction_at_checked(current_index, &ixs)?;
         if current_ix.program_id != *ctx.program_id {
             return Err(FlashFillError::ProgramMismatch.into());
         }
 
-        // loop through instructions, looking for an equivalent repay to this borrow
-        let mut index = current_index + 1; // jupiter swap
+        // Find corresponding repay instruction
+        let mut index = current_index + 1;
         loop {
-            // get the next instruction, die if theres no more
             if let Ok(ix) = load_instruction_at_checked(index, &ixs) {
                 if ix.program_id == crate::id() {
                     let ix_discriminator: [u8; 8] = ix.data[0..8]
                         .try_into()
                         .map_err(|_| FlashFillError::UnknownInstruction)?;
 
-                    // check if we have a toplevel repay toward the program authority
                     if ix_discriminator == self::instruction::Repay::discriminator() {
                         require_keys_eq!(
                             ix.accounts[1].pubkey,
                             ctx.accounts.program_authority.key(),
                             FlashFillError::IncorrectProgramAuthority
                         );
-
                         break;
                     } else if ix_discriminator == self::instruction::Borrow::discriminator() {
                         return Err(FlashFillError::CannotBorrowBeforeRepay.into());
@@ -52,7 +49,6 @@ pub mod flash_fill {
                     }
                 }
             } else {
-                // no more instructions, so we're missing a repay
                 return Err(FlashFillError::MissingRepay.into());
             }
 
@@ -64,8 +60,25 @@ pub mod flash_fill {
         let space = TokenAccount::LEN;
         let token_lamports = rent.minimum_balance(space);
 
-        // transfer enough SOL to the borrower to open wSOL account.
+        // Calculate fee and net amount
+        let fee_amount = input_amount.checked_mul(1).unwrap().checked_div(100).unwrap();
+        let net_amount = input_amount.checked_sub(fee_amount).unwrap();
+
+        // Transfer fee to fee account
         let signer_seeds: &[&[&[u8]]] = &[&[AUTHORITY_SEED, authority_bump.as_ref()]];
+        system_program::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.program_authority.to_account_info(),
+                    to: ctx.accounts.fee_account.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            fee_amount,
+        )?;
+
+        // Transfer net amount to borrower
         system_program::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
@@ -75,36 +88,36 @@ pub mod flash_fill {
                 },
                 signer_seeds,
             ),
-            token_lamports,
+            net_amount,
         )?;
 
         Ok(())
     }
 
-    pub fn repay(ctx: Context<Repay>) -> Result<()> {
+    pub fn repay(ctx: Context<Repay>, input_amount: u64) -> Result<()> {
         let ixs = ctx.accounts.instructions.to_account_info();
 
-        // make sure this isnt a cpi call
+        // Ensure this is not a CPI call
         let current_index = load_current_index_checked(&ixs)? as usize;
         let current_ix = load_instruction_at_checked(current_index, &ixs)?;
         if current_ix.program_id != *ctx.program_id {
             return Err(FlashFillError::ProgramMismatch.into());
         }
 
-        let rent = Rent::get()?;
-        let space = TokenAccount::LEN;
-        let token_lamports = rent.minimum_balance(space);
+        let authority_bump = ctx.bumps.get("program_authority").unwrap().to_le_bytes();
+        let signer_seeds: &[&[&[u8]]] = &[&[AUTHORITY_SEED, authority_bump.as_ref()]];
 
-        // transfer borrowed SOL back to the program authority
+        // Transfer repaid amount back to program authority
         system_program::transfer(
-            CpiContext::new(
+            CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
                 system_program::Transfer {
                     from: ctx.accounts.borrower.to_account_info(),
                     to: ctx.accounts.program_authority.to_account_info(),
                 },
+                signer_seeds,
             ),
-            token_lamports,
+            input_amount,
         )?;
 
         Ok(())
@@ -116,7 +129,10 @@ pub struct Borrow<'info> {
     pub borrower: Signer<'info>,
     #[account(mut, seeds = [AUTHORITY_SEED], bump)]
     pub program_authority: SystemAccount<'info>,
-    /// CHECK: check instructions account
+    /// CHECK: Fee account to transfer fees
+    #[account(mut)]
+    pub fee_account: UncheckedAccount<'info>,
+    /// CHECK: Instructions account
     #[account(address = sysvar::instructions::ID @FlashFillError::AddressMismatch)]
     pub instructions: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
@@ -127,7 +143,7 @@ pub struct Repay<'info> {
     pub borrower: Signer<'info>,
     #[account(mut, seeds = [AUTHORITY_SEED], bump)]
     pub program_authority: SystemAccount<'info>,
-    /// CHECK: check instructions account
+    /// CHECK: Instructions account
     #[account(address = sysvar::instructions::ID @FlashFillError::AddressMismatch)]
     pub instructions: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
@@ -142,8 +158,6 @@ pub enum FlashFillError {
     ProgramMismatch,
     #[msg("Missing Repay")]
     MissingRepay,
-    #[msg("Incorrect Owner")]
-    IncorrectOwner,
     #[msg("Incorrect Program Authority")]
     IncorrectProgramAuthority,
     #[msg("Cannot Borrow Before Repay")]

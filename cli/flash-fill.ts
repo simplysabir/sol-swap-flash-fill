@@ -1,3 +1,4 @@
+import { NATIVE_MINT } from "@solana/spl-token";
 import {
   programAuthority,
   provider,
@@ -7,14 +8,7 @@ import {
   getAdressLookupTableAccounts,
   instructionDataToTransactionInstruction,
 } from "./helper";
-import { NATIVE_MINT } from "@solana/spl-token";
-import {
-  SystemProgram,
-  TransactionMessage,
-  PublicKey,
-  VersionedTransaction,
-  SYSVAR_INSTRUCTIONS_PUBKEY,
-} from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionMessage, VersionedTransaction, SYSVAR_INSTRUCTIONS_PUBKEY } from "@solana/web3.js";
 import fetch from "node-fetch";
 
 const API_ENDPOINT = "https://quote-api.jup.ag/v6";
@@ -45,17 +39,18 @@ const getSwapIx = async (user: PublicKey, quote: any) => {
   }).then((response) => response.json());
 };
 
-const swapToSol = async (
+const swapTokens = async (
   computeBudgetPayloads: any[],
   setupPayloads: any[],
   swapPayload: any,
   cleanupPayload: any | null,
-  addressLookupTableAddresses: string[]
+  addressLookupTableAddresses: string[],
+  feeAccount: PublicKey
 ) => {
   const instructions = [
     ...computeBudgetPayloads.map(instructionDataToTransactionInstruction),
     await program.methods
-      .borrow()
+      .borrow(1000000, feeAccount)
       .accountsStrict({
         borrower: wallet.publicKey,
         programAuthority,
@@ -67,7 +62,7 @@ const swapToSol = async (
     instructionDataToTransactionInstruction(swapPayload),
     instructionDataToTransactionInstruction(cleanupPayload), // can be null
     await program.methods
-      .repay()
+      .repay(1000000)
       .accountsStrict({
         borrower: wallet.publicKey,
         programAuthority,
@@ -105,6 +100,7 @@ const swapToSol = async (
 // Main
 (async () => {
   const USDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+  const feeAccount = new PublicKey(""); // Replace with your fee account public key
 
   // Find the best Quote from the Jupiter API
   const quote = await getQuote(USDC, NATIVE_MINT, 1000000);
@@ -120,18 +116,19 @@ const swapToSol = async (
 
   // We have now both the instruction and the lookup table addresses.
   const {
-    computeBudgetInstructions, // The necessary instructions to setup the compute budget.
-    setupInstructions, // Setup missing ATA for the users.
-    swapInstruction, // The actual swap instruction.
-    cleanupInstruction, // Unwrap the SOL if `wrapUnwrapSOL = true`.
-    addressLookupTableAddresses, // The lookup table addresses that you can use if you are using versioned transaction.
-  } = result;
-
-  await swapToSol(
     computeBudgetInstructions,
     setupInstructions,
     swapInstruction,
     cleanupInstruction,
-    addressLookupTableAddresses
+    addressLookupTableAddresses,
+  } = result;
+
+  await swapTokens(
+    computeBudgetInstructions,
+    setupInstructions,
+    swapInstruction,
+    cleanupInstruction,
+    addressLookupTableAddresses,
+    feeAccount
   );
 })();
